@@ -19,6 +19,7 @@ package rbd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/golang/glog"
@@ -29,6 +30,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"k8s.io/kubernetes/pkg/util/mount"
+	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
 
 	"github.com/kubernetes-csi/drivers/pkg/csi-common"
 )
@@ -40,27 +42,38 @@ type nodeServer struct {
 func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	targetPath := req.GetTargetPath()
 
-	if !strings.HasSuffix(targetPath, "/mount") {
-		return nil, fmt.Errorf("rnd: malformed the value of target path: %s", targetPath)
-	}
-	s := strings.Split(strings.TrimSuffix(targetPath, "/mount"), "/")
-	volName := s[len(s)-1]
+	var volName string
+	isBlock := req.GetVolumeCapability().GetBlock() != nil
+	if isBlock {
+		if !strings.HasSuffix(targetPath, "/dev/file") {
+			return nil, fmt.Errorf("rnd: malformed the value of target path: %s", targetPath)
+		}
+		s := strings.Split(strings.TrimSuffix(targetPath, "/dev/file"), "/")
+		volName = s[len(s)-1]
+	} else {
+		if !strings.HasSuffix(targetPath, "/mount") {
+			return nil, fmt.Errorf("rnd: malformed the value of target path: %s", targetPath)
+		}
+		s := strings.Split(strings.TrimSuffix(targetPath, "/mount"), "/")
+		volName = s[len(s)-1]
 
-	notMnt, err := mount.New("").IsLikelyNotMountPoint(targetPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			if err = os.MkdirAll(targetPath, 0750); err != nil {
+		notMnt, err := mount.New("").IsLikelyNotMountPoint(targetPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				if err = os.MkdirAll(targetPath, 0750); err != nil {
+					return nil, status.Error(codes.Internal, err.Error())
+				}
+				notMnt = true
+			} else {
 				return nil, status.Error(codes.Internal, err.Error())
 			}
-			notMnt = true
-		} else {
-			return nil, status.Error(codes.Internal, err.Error())
+		}
+
+		if !notMnt {
+			return &csi.NodePublishVolumeResponse{}, nil
 		}
 	}
 
-	if !notMnt {
-		return &csi.NodePublishVolumeResponse{}, nil
-	}
 	volOptions, err := getRBDVolumeOptions(req.VolumeAttributes)
 	if err != nil {
 		return nil, err
@@ -78,19 +91,27 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	attrib := req.GetVolumeAttributes()
 	mountFlags := req.GetVolumeCapability().GetMount().GetMountFlags()
 
-	glog.V(4).Infof("target %v\nfstype %v\ndevice %v\nreadonly %v\nattributes %v\n mountflags %v\n",
-		targetPath, fsType, devicePath, readOnly, attrib, mountFlags)
+	glog.V(4).Infof("target %v\nisBlock %v\nfstype %v\ndevice %v\nreadonly %v\nattributes %v\n mountflags %v\n",
+		targetPath, isBlock, fsType, devicePath, readOnly, attrib, mountFlags)
 
-	options := []string{}
-	if readOnly {
-		options = append(options, "ro")
+	if isBlock {
+		blkUtil := volumepathhandler.NewBlockVolumePathHandler()
+		targetMapPath := filepath.Dir(targetPath)
+		targetMapName := filepath.Base(targetPath)
+		if err := blkUtil.MapDevice(devicePath, targetMapPath, targetMapName); err != nil {
+			return nil, err
+		}
+	} else {
+		options := []string{}
+		if readOnly {
+			options = append(options, "ro")
+		}
+
+		diskMounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: mount.NewOsExec()}
+		if err := diskMounter.FormatAndMount(devicePath, targetPath, fsType, options); err != nil {
+			return nil, err
+		}
 	}
-
-	diskMounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: mount.NewOsExec()}
-	if err := diskMounter.FormatAndMount(devicePath, targetPath, fsType, options); err != nil {
-		return nil, err
-	}
-
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
